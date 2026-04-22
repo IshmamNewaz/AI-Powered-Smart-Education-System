@@ -1,0 +1,4 @@
+Django==6.0.4
+django-cors-headers==4.9.0
+scikit-learn==1.8.0
+pandas==2.3.3
