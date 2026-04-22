@@ -5,35 +5,65 @@ from functools import lru_cache
 import csv
 from urllib import error, request
 import pandas as pd
+from django.db import transaction
 
 from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
-from .models import AIChatMessage, AIChatThread, SmartUser
+from .models import AIChatMessage, AIChatThread, CourseAssignment, LibraryApplication, RegistrationProfile, SmartUser, StudentSubjectMark, WeeklyClassSchedule
 
 OLLAMA_MODEL = "hf.co/unsloth/Llama-3.2-1B-Instruct-GGUF:UD-Q4_K_XL"
 OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_PATH = PROJECT_ROOT / "MLModel" / "best_pass_fail_model.pkl"
 DATASET_PATH = PROJECT_ROOT / "MLModel" / "student_dataset_500_rows.csv"
+ALLOWED_SUBJECTS = {"Physics", "Chemistry", "Biology", "Math"}
 
 
-def _menu_payload():
+def _normalize_subject_name(value):
+	text = str(value or "").strip()
+	if text.lower() in ["mathematics", "math"]:
+		return "Math"
+	if text.lower() == "physics":
+		return "Physics"
+	if text.lower() == "chemistry":
+		return "Chemistry"
+	if text.lower() == "biology":
+		return "Biology"
+	return text
+
+
+def _menu_payload(user=None):
+	top_items = []
+	left_items = ["Academics", "Library", "Others", "AI Help", "Notifications"]
+
+	if not user:
+		return {
+			"top": {
+				"title": "ASEMS",
+				"items": top_items,
+				"profile_dropdown": ["Profile", "Settings", "Logout"],
+			},
+			"left": left_items,
+		}
+
+	if user.user_type == SmartUser.MANAGEMENT:
+		top_items.extend(["Courses and Result", "Registration", "Grade Report"])
+		left_items.extend(["Grade Reports", "Registration", "Assign Courses"])
+	if user.user_type == SmartUser.STUDENT:
+		top_items.extend(["Courses and Result", "Grade Report"])
+		left_items.extend(["Grade Reports", "Weekly Schedule"])
+	if user.user_type == SmartUser.TEACHER:
+		left_items.extend(["Weekly Schedule", "Marks Entry"])
+
 	return {
 		"top": {
 			"title": "ASEMS",
-			"items": ["Courses and Result", "Registration", "Grade Report"],
+			"items": top_items,
 			"profile_dropdown": ["Profile", "Settings", "Logout"],
 		},
-		"left": [
-			"Academics",
-			"Grade Reports",
-			"Library",
-			"Others",
-			"AI Help",
-			"Notifications",
-		],
+		"left": left_items,
 	}
 
 
@@ -60,6 +90,68 @@ def _require_user(request):
 	if not user:
 		return None, JsonResponse({"error": "Unauthorized."}, status=401)
 	return user, None
+
+
+def _require_management(user):
+	if user.user_type != SmartUser.MANAGEMENT:
+		return JsonResponse({"error": "Only management can access this endpoint."}, status=403)
+	return None
+
+
+def _require_student(user):
+	if user.user_type != SmartUser.STUDENT:
+		return JsonResponse({"error": "Only students can access this endpoint."}, status=403)
+	return None
+
+
+def _require_student_or_management(user):
+	if user.user_type not in [SmartUser.STUDENT, SmartUser.MANAGEMENT]:
+		return JsonResponse({"error": "Only students or management can access this endpoint."}, status=403)
+	return None
+
+
+def _require_teacher(user):
+	if user.user_type != SmartUser.TEACHER:
+		return JsonResponse({"error": "Only teachers can access this endpoint."}, status=403)
+	return None
+
+
+def _require_student_or_teacher(user):
+	if user.user_type not in [SmartUser.STUDENT, SmartUser.TEACHER]:
+		return JsonResponse({"error": "Only students or teachers can access this endpoint."}, status=403)
+	return None
+
+
+def _user_type_label(user_type):
+	lookup = {
+		SmartUser.STUDENT: "Student",
+		SmartUser.TEACHER: "Teacher",
+		SmartUser.MANAGEMENT: "Management",
+	}
+	return lookup.get(user_type, "Unknown")
+
+
+def _serialize_schedule_item(assignment):
+	return {
+		"assignment_id": assignment.id,
+		"course_name": assignment.course_name,
+		"class_name": assignment.class_name,
+		"target_user_id": assignment.target_user.id,
+		"target_user_name": assignment.target_user.name,
+		"target_role": assignment.target_role,
+		"teacher_user_id": assignment.teacher_user.id if assignment.teacher_user else None,
+		"teacher_user_name": assignment.teacher_user.name if assignment.teacher_user else "",
+		"notes": assignment.notes,
+		"weekly_slots": [
+			{
+				"day": slot.day_of_week,
+				"start_time": slot.start_time.strftime("%H:%M"),
+				"end_time": slot.end_time.strftime("%H:%M"),
+				"room": slot.room,
+			}
+			for slot in assignment.weekly_slots.all()
+		],
+	}
 
 
 def _serialize_thread(thread):
@@ -181,6 +273,10 @@ def _load_dataset_rows():
 	with open(DATASET_PATH, newline="", encoding="utf-8") as handle:
 		reader = csv.DictReader(handle)
 		for row in reader:
+			normalized_subject = _normalize_subject_name(row.get("subject"))
+			if normalized_subject not in ALLOWED_SUBJECTS:
+				continue
+			row["subject"] = normalized_subject
 			rows.append(row)
 	return rows
 
@@ -193,15 +289,88 @@ def _load_prediction_model():
 
 def _student_rows(student_id):
 	rows = [row for row in _load_dataset_rows() if str(row.get("student_id")) == str(student_id)]
-	if rows:
-		return rows
+	return rows
 
-	all_rows = _load_dataset_rows()
-	if not all_rows:
+
+def _normalize_dataset_student_id(value):
+	try:
+		student_num = int(str(value).strip())
+	except (TypeError, ValueError):
+		return "1000"
+	if student_num < 1000:
+		student_num += 1000
+	return str(student_num)
+
+
+def _student_dataset_id_from_user(user):
+	profile = getattr(user, "registration_profile", None)
+	roll = ""
+	if profile and profile.profile_data:
+		roll = str(profile.profile_data.get("roll_number", "")).strip()
+	if roll:
+		return _normalize_dataset_student_id(roll)
+	return _normalize_dataset_student_id(user.id)
+
+
+def _rows_from_teacher_marks(student_user):
+	mark_rows = StudentSubjectMark.objects.filter(student=student_user)
+	if not mark_rows.exists():
 		return []
 
-	first_id = all_rows[0].get("student_id")
-	return [row for row in all_rows if row.get("student_id") == first_id]
+	dataset_id = _student_dataset_id_from_user(student_user)
+	rows = []
+	for mark in mark_rows:
+		normalized_subject = _normalize_subject_name(mark.subject)
+		if normalized_subject not in ALLOWED_SUBJECTS:
+			continue
+		rows.append(
+			{
+				"student_id": dataset_id,
+				"subject": normalized_subject,
+				"ct_1": mark.ct_1,
+				"ct_2": mark.ct_2,
+				"ct_3": mark.ct_3,
+				"ct_4": mark.ct_4,
+				"ct_5": mark.ct_5,
+				"ct_6": mark.ct_6,
+				"ct_7": mark.ct_7,
+				"ct_8": mark.ct_8,
+				"term_1": mark.term_1,
+				"term_2": mark.term_2,
+				"model_1": mark.model_1,
+				"model_2": mark.model_2,
+				"model_3": mark.model_3,
+			}
+		)
+	return rows
+
+
+def _management_validate_student(student_id, class_name):
+	if not student_id:
+		return None, JsonResponse({"error": "student_id is required for management search."}, status=400)
+	if not class_name:
+		return None, JsonResponse({"error": "class_name is required for management search."}, status=400)
+
+	try:
+		target_user = SmartUser.objects.get(id=student_id, user_type=SmartUser.STUDENT)
+	except SmartUser.DoesNotExist:
+		return None, JsonResponse({"error": "Student not found for provided ID."}, status=404)
+
+	profile = getattr(target_user, "registration_profile", None)
+	student_class = str((profile.profile_data or {}).get("class_semester_year", "")).strip() if profile else ""
+	if student_class != class_name:
+		return None, JsonResponse({"error": "Provided class_name does not match this student."}, status=400)
+
+	return target_user, None
+
+
+def _resolve_student_rows_for_user(student_user, requested_student_id=""):
+	teacher_rows = _rows_from_teacher_marks(student_user)
+	if teacher_rows:
+		return teacher_rows
+
+	dataset_student_id = _normalize_dataset_student_id(requested_student_id or _student_dataset_id_from_user(student_user))
+	return _student_rows(dataset_student_id)
 
 
 def _build_semester_subject_row(row, semester):
@@ -279,6 +448,139 @@ def _build_llm_prediction_analysis(student_id, subject_predictions, overall_pred
 		])
 	except RuntimeError:
 		return "LLM analysis is currently unavailable. Please ensure Ollama is running and try again."
+
+
+def _required_fields_by_role(role_name):
+	common = ["full_name", "email_address", "phone_number", "username", "password", "confirm_password"]
+	if role_name == "student":
+		return common + ["date_of_birth", "gender", "institution_name", "department_program", "class_semester_year", "academic_session"]
+	if role_name == "teacher":
+		return common + ["employee_id", "date_of_birth", "gender", "institution_name", "department", "designation", "subjects_teaching"]
+	if role_name == "management":
+		return common + ["employee_staff_id", "date_of_birth", "institution_name", "department", "position", "role_type"]
+	return common
+
+
+def _role_map():
+	return {
+		"student": SmartUser.STUDENT,
+		"teacher": SmartUser.TEACHER,
+		"management": SmartUser.MANAGEMENT,
+	}
+
+
+def _role_name_from_type(user_type):
+	lookup = {value: key for key, value in _role_map().items()}
+	return lookup.get(user_type, "unknown")
+
+
+def _parse_registration_input(request):
+	content_type = request.META.get("CONTENT_TYPE", "")
+	if "multipart/form-data" in content_type:
+		role = str(request.POST.get("role", "")).strip().lower()
+		payload_raw = request.POST.get("payload", "{}")
+		try:
+			payload = json.loads(payload_raw)
+		except json.JSONDecodeError:
+			payload = {}
+		profile_photo = request.FILES.get("profile_photo")
+		return role, payload, profile_photo
+
+	try:
+		data = json.loads(request.body.decode("utf-8"))
+	except (json.JSONDecodeError, UnicodeDecodeError):
+		return "", {}, None
+
+	role = str(data.get("role", "")).strip().lower()
+	payload = data.get("payload") or {}
+	return role, payload, None
+
+
+def _serialize_registration_profile(profile, request):
+	photo_url = ""
+	if profile.profile_photo:
+		try:
+			photo_url = request.build_absolute_uri(profile.profile_photo.url)
+		except Exception:
+			photo_url = profile.profile_photo.url
+
+	return {
+		"id": profile.id,
+		"role": _role_name_from_type(profile.role),
+		"user_id": profile.smart_user.id,
+		"username": profile.smart_user.name,
+		"full_name": profile.profile_data.get("full_name", ""),
+		"email_address": profile.profile_data.get("email_address", ""),
+		"phone_number": profile.profile_data.get("phone_number", ""),
+		"profile_photo_url": photo_url,
+		"profile_data": profile.profile_data,
+		"created_at": profile.created_at.isoformat(),
+		"updated_at": profile.updated_at.isoformat(),
+	}
+
+
+def _save_registration(role, payload, created_by_user, profile_photo=None, existing_profile=None):
+	role_map = _role_map()
+	if role not in role_map:
+		return None, "Invalid role."
+
+	missing = [field for field in _required_fields_by_role(role) if not str(payload.get(field, "")).strip()]
+	if missing:
+		return None, f"Missing required fields: {', '.join(missing)}"
+
+	password = str(payload.get("password", "")).strip()
+	confirm_password = str(payload.get("confirm_password", "")).strip()
+	if password != confirm_password:
+		return None, "Password and confirm password do not match."
+
+	username = str(payload.get("username", "")).strip()
+	if existing_profile:
+		if existing_profile.smart_user.name != username and SmartUser.objects.filter(name=username).exists():
+			return None, "Username already exists."
+	else:
+		if SmartUser.objects.filter(name=username).exists():
+			return None, "Username already exists."
+
+	with transaction.atomic():
+		if existing_profile:
+			smart_user = existing_profile.smart_user
+			smart_user.name = username
+			smart_user.user_type = role_map[role]
+			if password:
+				smart_user.password = password
+			smart_user.save()
+			profile = existing_profile
+			profile.role = role_map[role]
+		else:
+			smart_user = SmartUser.objects.create(name=username, password=password, user_type=role_map[role])
+			profile = RegistrationProfile(smart_user=smart_user, role=role_map[role])
+
+		profile_data = dict(payload)
+		profile_data.pop("confirm_password", None)
+		profile_data["created_by"] = created_by_user.id
+		if role == "student":
+			profile_data["roll_number"] = str(payload.get("roll_number") or smart_user.id)
+		if role == "teacher":
+			profile_data["employee_id"] = str(payload.get("employee_id") or smart_user.id)
+		if role == "management":
+			profile_data["employee_staff_id"] = str(payload.get("employee_staff_id") or smart_user.id)
+			profile_data["access_permissions"] = [
+				"Student Management",
+				"Teacher Management",
+				"Course Management",
+				"Analytics Dashboard",
+				"AI System Controls",
+				"Grade Reports",
+				"Registration",
+				"Assignments",
+			]
+
+		profile.profile_data = profile_data
+		if profile_photo:
+			profile.profile_photo = profile_photo
+		profile.save()
+
+	return profile, None
 
 
 def _curriculum_report_payload(rows):
@@ -388,7 +690,7 @@ def login_view(request):
 			"message": "Login successful.",
 			"authenticated": True,
 			"user": _serialize_user(user),
-			"menus": _menu_payload(),
+			"menus": _menu_payload(user),
 		}
 	)
 
@@ -404,13 +706,13 @@ def logout_view(request):
 def session_view(request):
 	user = _get_session_user(request)
 	if not user:
-		return JsonResponse({"authenticated": False, "menus": _menu_payload()})
+		return JsonResponse({"authenticated": False, "menus": _menu_payload(None)})
 
 	return JsonResponse(
 		{
 			"authenticated": True,
 			"user": _serialize_user(user),
-			"menus": _menu_payload(),
+			"menus": _menu_payload(user),
 		}
 	)
 
@@ -425,7 +727,7 @@ def dashboard_view(request):
 		{
 			"welcome": f"Welcome back, {user.name}.",
 			"user": _serialize_user(user),
-			"menus": _menu_payload(),
+			"menus": _menu_payload(user),
 		}
 	)
 
@@ -610,10 +912,21 @@ def grade_report_view(request):
 	user, error_response = _require_user(request)
 	if error_response:
 		return error_response
+	role_error = _require_student_or_management(user)
+	if role_error:
+		return role_error
 
 	mode = str(request.GET.get("mode", "semester")).strip().lower()
-	student_id = str(request.GET.get("student_id", user.id)).strip()
-	rows = _student_rows(student_id)
+	class_name = str(request.GET.get("class_name", "")).strip()
+	if user.user_type == SmartUser.STUDENT:
+		target_student_user = user
+		student_id = str(user.id)
+	else:
+		student_id = str(request.GET.get("student_id", "")).strip()
+		target_student_user, validation_error = _management_validate_student(student_id, class_name)
+		if validation_error:
+			return validation_error
+	rows = _resolve_student_rows_for_user(target_student_user, student_id)
 	if not rows:
 		return JsonResponse({"error": "No student records found."}, status=404)
 
@@ -623,6 +936,7 @@ def grade_report_view(request):
 		payload = _semester_report_payload(rows)
 
 	payload["student_id"] = student_id
+	payload["class_name"] = class_name if user.user_type == SmartUser.MANAGEMENT else ""
 	payload["mode"] = mode
 	return JsonResponse(payload)
 
@@ -633,14 +947,25 @@ def grade_report_predict_view(request):
 	user, error_response = _require_user(request)
 	if error_response:
 		return error_response
+	role_error = _require_student_or_management(user)
+	if role_error:
+		return role_error
 
 	try:
 		data = json.loads(request.body.decode("utf-8"))
 	except (json.JSONDecodeError, UnicodeDecodeError):
 		return JsonResponse({"error": "Invalid JSON payload."}, status=400)
 
-	student_id = str(data.get("student_id", user.id)).strip()
-	rows = _student_rows(student_id)
+	class_name = str(data.get("class_name", "")).strip()
+	if user.user_type == SmartUser.STUDENT:
+		target_student_user = user
+		student_id = str(user.id)
+	else:
+		student_id = str(data.get("student_id", "")).strip()
+		target_student_user, validation_error = _management_validate_student(student_id, class_name)
+		if validation_error:
+			return validation_error
+	rows = _resolve_student_rows_for_user(target_student_user, student_id)
 	if not rows:
 		return JsonResponse({"error": "No student records found."}, status=404)
 
@@ -661,6 +986,7 @@ def grade_report_predict_view(request):
 	return JsonResponse(
 		{
 			"student_id": student_id,
+			"class_name": class_name if user.user_type == SmartUser.MANAGEMENT else "",
 			"semester_3_prediction": overall,
 			"subject_predictions": subject_predictions,
 			"llm_output": llm_output,
@@ -671,3 +997,479 @@ def grade_report_predict_view(request):
 			},
 		}
 	)
+
+
+@csrf_exempt
+@require_POST
+def registration_submit_view(request):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+	role_error = _require_management(user)
+	if role_error:
+		return role_error
+
+	role, payload, profile_photo = _parse_registration_input(request)
+	profile, validation_error = _save_registration(role, payload, user, profile_photo=profile_photo)
+	if validation_error:
+		return JsonResponse({"error": validation_error}, status=400)
+
+	return JsonResponse(
+		{
+			"message": f"{role.title()} registration successful.",
+			"registered_user": {
+				"user_id": profile.smart_user.id,
+				"username": profile.smart_user.name,
+				"user_type": profile.smart_user.user_type,
+			},
+		}
+	)
+
+
+@require_GET
+def registration_list_view(request):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+	role_error = _require_management(user)
+	if role_error:
+		return role_error
+
+	role = str(request.GET.get("role", "")).strip().lower()
+	queryset = RegistrationProfile.objects.select_related("smart_user").all().order_by("-created_at")
+	role_map = _role_map()
+	if role in role_map:
+		queryset = queryset.filter(role=role_map[role])
+
+	items = [_serialize_registration_profile(item, request) for item in queryset]
+	return JsonResponse({"items": items})
+
+
+@csrf_exempt
+@require_POST
+def registration_update_view(request, profile_id):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+	role_error = _require_management(user)
+	if role_error:
+		return role_error
+
+	try:
+		profile = RegistrationProfile.objects.select_related("smart_user").get(id=profile_id)
+	except RegistrationProfile.DoesNotExist:
+		return JsonResponse({"error": "Registration profile not found."}, status=404)
+
+	role, payload, profile_photo = _parse_registration_input(request)
+	if not role:
+		role = _role_name_from_type(profile.role)
+
+	updated_profile, validation_error = _save_registration(
+		role,
+		payload,
+		user,
+		profile_photo=profile_photo,
+		existing_profile=profile,
+	)
+	if validation_error:
+		return JsonResponse({"error": validation_error}, status=400)
+
+	return JsonResponse(
+		{
+			"message": "Registration updated successfully.",
+			"item": _serialize_registration_profile(updated_profile, request),
+		}
+	)
+
+
+@csrf_exempt
+@require_POST
+def registration_delete_view(request, profile_id):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+	role_error = _require_management(user)
+	if role_error:
+		return role_error
+
+	try:
+		profile = RegistrationProfile.objects.select_related("smart_user").get(id=profile_id)
+	except RegistrationProfile.DoesNotExist:
+		return JsonResponse({"error": "Registration profile not found."}, status=404)
+
+	profile.smart_user.delete()
+	return JsonResponse({"message": "Registration deleted successfully."})
+
+
+@require_GET
+def students_by_class_view(request):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+	role_error = _require_management(user)
+	if role_error:
+		return role_error
+
+	requested_class = str(request.GET.get("class_name", "")).strip()
+	profiles = RegistrationProfile.objects.select_related("smart_user").filter(role=SmartUser.STUDENT)
+
+	class_map = {str(index): [] for index in range(1, 11)}
+	for profile in profiles:
+		class_name = str((profile.profile_data or {}).get("class_semester_year", "")).strip()
+		if requested_class and class_name != requested_class:
+			continue
+		if class_name in class_map:
+			class_map[class_name].append(
+				{
+					"user_id": profile.smart_user.id,
+					"username": profile.smart_user.name,
+					"full_name": profile.profile_data.get("full_name", ""),
+					"class_name": class_name,
+				}
+			)
+
+	items = [{"class_name": key, "students": value} for key, value in class_map.items()]
+	return JsonResponse({"items": items})
+
+
+@csrf_exempt
+@require_POST
+def course_assignment_create_view(request):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+	role_error = _require_management(user)
+	if role_error:
+		return role_error
+
+	try:
+		data = json.loads(request.body.decode("utf-8"))
+	except (json.JSONDecodeError, UnicodeDecodeError):
+		return JsonResponse({"error": "Invalid JSON payload."}, status=400)
+
+	target_role = str(data.get("target_role", "")).strip().lower()
+	course_name = str(data.get("course_name", "")).strip()
+	normalized_course_name = _normalize_subject_name(course_name)
+	class_name = str(data.get("class_name", "")).strip()
+	notes = str(data.get("notes", "")).strip()
+	slots = data.get("weekly_slots") or []
+    
+	valid_classes = {str(index) for index in range(1, 11)}
+
+	def _normalized_class(value):
+		text = str(value or "").strip()
+		digits = "".join(ch for ch in text if ch.isdigit())
+		if digits in valid_classes:
+			return digits
+		return text
+
+	if not course_name:
+		return JsonResponse({"error": "Course name is required."}, status=400)
+	if normalized_course_name not in ALLOWED_SUBJECTS:
+		return JsonResponse({"error": "course_name must be one of Physics, Chemistry, Biology, Math."}, status=400)
+	if target_role not in ["student", "teacher"]:
+		return JsonResponse({"error": "target_role must be student or teacher."}, status=400)
+
+	raw_ids = data.get("target_user_ids") or []
+	if data.get("target_user_id"):
+		raw_ids = raw_ids + [data.get("target_user_id")]
+	target_ids = []
+	for raw_id in raw_ids:
+		try:
+			target_ids.append(int(raw_id))
+		except (TypeError, ValueError):
+			continue
+	target_ids = sorted(set(target_ids))
+	if not target_ids:
+		return JsonResponse({"error": "At least one valid target user ID is required."}, status=400)
+
+	if not isinstance(slots, list) or not slots:
+		return JsonResponse({"error": "At least one weekly slot is required."}, status=400)
+
+	if target_role == "student" and not class_name:
+		return JsonResponse({"error": "class_name is required for student assignments."}, status=400)
+	if target_role == "student" and class_name not in valid_classes:
+		return JsonResponse({"error": "class_name must be numeric and between 1 and 10."}, status=400)
+
+	role_code = SmartUser.STUDENT if target_role == "student" else SmartUser.TEACHER
+	users = list(SmartUser.objects.filter(id__in=target_ids, user_type=role_code))
+	if len(users) != len(target_ids):
+		return JsonResponse({"error": "Some target users were not found for the selected role."}, status=400)
+
+	if target_role == "student":
+		invalid_students = []
+		for target_user in users:
+			profile = getattr(target_user, "registration_profile", None)
+			student_class = _normalized_class((profile.profile_data or {}).get("class_semester_year", "")) if profile else ""
+			if student_class != class_name:
+				invalid_students.append(target_user.id)
+		if invalid_students:
+			return JsonResponse(
+				{"error": f"These students do not match class_name '{class_name}': {invalid_students}"},
+				status=400,
+			)
+
+	created_assignments = []
+	with transaction.atomic():
+		for target_user in users:
+			assignment = CourseAssignment.objects.create(
+				created_by=user,
+				target_user=target_user,
+				teacher_user=None,
+				target_role=role_code,
+				course_name=normalized_course_name,
+				class_name=class_name if target_role == "student" else "",
+				notes=notes,
+			)
+			for slot in slots:
+				day = str(slot.get("day", "")).strip().lower()
+				start_time = str(slot.get("start_time", "")).strip()
+				end_time = str(slot.get("end_time", "")).strip()
+				room = str(slot.get("room", "")).strip()
+				if not day or not start_time or not end_time:
+					continue
+				WeeklyClassSchedule.objects.create(
+					assignment=assignment,
+					day_of_week=day,
+					start_time=start_time,
+					end_time=end_time,
+					room=room,
+				)
+			created_assignments.append(assignment)
+
+	if not created_assignments:
+		return JsonResponse({"error": "No valid schedule slots were provided."}, status=400)
+
+	return JsonResponse(
+		{
+			"message": "Course assignment created successfully.",
+			"count": len(created_assignments),
+			"items": [_serialize_schedule_item(item) for item in created_assignments],
+		}
+	)
+
+
+@require_GET
+def weekly_schedule_view(request):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+
+	queryset = CourseAssignment.objects.select_related("target_user").prefetch_related("weekly_slots")
+	if user.user_type in [SmartUser.STUDENT, SmartUser.TEACHER]:
+		queryset = queryset.filter(target_user=user)
+
+	items = [_serialize_schedule_item(item) for item in queryset.order_by("-created_at")]
+	return JsonResponse({"items": items})
+
+
+@require_GET
+def teacher_students_view(request):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+	role_error = _require_teacher(user)
+	if role_error:
+		return role_error
+
+	assignments = CourseAssignment.objects.select_related("target_user").filter(
+		target_role=SmartUser.STUDENT,
+	)
+
+	student_map = {}
+	for assignment in assignments:
+		profile = getattr(assignment.target_user, "registration_profile", None)
+		full_name = (profile.profile_data or {}).get("full_name", "") if profile else ""
+		student_map[assignment.target_user.id] = {
+			"user_id": assignment.target_user.id,
+			"username": assignment.target_user.name,
+			"full_name": full_name,
+			"class_name": assignment.class_name,
+		}
+
+	return JsonResponse({"items": list(student_map.values())})
+
+
+@require_GET
+def teacher_marks_view(request):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+	role_error = _require_teacher(user)
+	if role_error:
+		return role_error
+
+	student_id = request.GET.get("student_id")
+	marks = StudentSubjectMark.objects.filter(teacher=user)
+	if student_id:
+		marks = marks.filter(student_id=student_id)
+
+	items = [
+		{
+			"id": mark.id,
+			"student_id": mark.student.id,
+			"student_name": mark.student.name,
+			"class_name": mark.class_name,
+			"subject": mark.subject,
+			"ct_1": mark.ct_1,
+			"ct_2": mark.ct_2,
+			"ct_3": mark.ct_3,
+			"ct_4": mark.ct_4,
+			"ct_5": mark.ct_5,
+			"ct_6": mark.ct_6,
+			"ct_7": mark.ct_7,
+			"ct_8": mark.ct_8,
+			"term_1": mark.term_1,
+			"term_2": mark.term_2,
+			"model_1": mark.model_1,
+			"model_2": mark.model_2,
+			"model_3": mark.model_3,
+		}
+		for mark in marks
+	]
+	return JsonResponse({"items": items})
+
+
+@csrf_exempt
+@require_POST
+def teacher_mark_upsert_view(request):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+	role_error = _require_teacher(user)
+	if role_error:
+		return role_error
+
+	try:
+		data = json.loads(request.body.decode("utf-8"))
+	except (json.JSONDecodeError, UnicodeDecodeError):
+		return JsonResponse({"error": "Invalid JSON payload."}, status=400)
+
+	student_id = data.get("student_id")
+	subject = str(data.get("subject", "")).strip()
+	normalized_subject = _normalize_subject_name(subject)
+	if not student_id or not subject:
+		return JsonResponse({"error": "student_id and subject are required."}, status=400)
+	if normalized_subject not in ALLOWED_SUBJECTS:
+		return JsonResponse({"error": "subject must be one of Physics, Chemistry, Biology, Math."}, status=400)
+
+	try:
+		student_user = SmartUser.objects.get(id=int(student_id), user_type=SmartUser.STUDENT)
+	except (TypeError, ValueError, SmartUser.DoesNotExist):
+		return JsonResponse({"error": "Student not found."}, status=404)
+
+	assignment = CourseAssignment.objects.filter(target_user=student_user, target_role=SmartUser.STUDENT).first()
+	if not assignment:
+		return JsonResponse({"error": "Student is not assigned in any course yet."}, status=403)
+
+	defaults = {
+		"class_name": assignment.class_name,
+		"ct_1": _to_int(data.get("ct_1")),
+		"ct_2": _to_int(data.get("ct_2")),
+		"ct_3": _to_int(data.get("ct_3")),
+		"ct_4": _to_int(data.get("ct_4")),
+		"ct_5": _to_int(data.get("ct_5")),
+		"ct_6": _to_int(data.get("ct_6")),
+		"ct_7": _to_int(data.get("ct_7")),
+		"ct_8": _to_int(data.get("ct_8")),
+		"term_1": _to_int(data.get("term_1")),
+		"term_2": _to_int(data.get("term_2")),
+		"model_1": _to_int(data.get("model_1")),
+		"model_2": _to_int(data.get("model_2")),
+		"model_3": _to_int(data.get("model_3")),
+	}
+	mark, _created = StudentSubjectMark.objects.update_or_create(
+		teacher=user,
+		student=student_user,
+		subject=normalized_subject,
+		defaults=defaults,
+	)
+
+	return JsonResponse(
+		{
+			"message": "Marks saved successfully.",
+			"item": {
+				"id": mark.id,
+				"student_id": mark.student.id,
+				"subject": mark.subject,
+				"class_name": mark.class_name,
+			},
+		}
+	)
+
+
+@csrf_exempt
+@require_POST
+def library_application_submit_view(request):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+
+	role_error = _require_student_or_teacher(user)
+	if role_error:
+		return role_error
+
+	try:
+		data = json.loads(request.body.decode("utf-8"))
+	except (json.JSONDecodeError, UnicodeDecodeError):
+		return JsonResponse({"error": "Invalid JSON payload."}, status=400)
+
+	resource_type = str(data.get("resource_type", "")).strip()
+	explanation = str(data.get("explanation", "")).strip()
+
+	student_resource_types = ["Books", "Technical", "Teacher", "Probation", "Others"]
+	teacher_resource_types = ["Books", "Technical", "Student", "Special resources", "Others"]
+	allowed = student_resource_types if user.user_type == SmartUser.STUDENT else teacher_resource_types
+
+	if resource_type not in allowed:
+		return JsonResponse({"error": "Invalid resource type for your role."}, status=400)
+	if not explanation:
+		return JsonResponse({"error": "Explanation is required."}, status=400)
+
+	item = LibraryApplication.objects.create(
+		requester=user,
+		requester_role=user.user_type,
+		resource_type=resource_type,
+		explanation=explanation,
+	)
+
+	return JsonResponse(
+		{
+			"message": "Library application submitted successfully.",
+			"item": {
+				"id": item.id,
+				"requester_id": user.id,
+				"requester_name": user.name,
+				"requester_role": _user_type_label(user.user_type),
+				"resource_type": item.resource_type,
+				"explanation": item.explanation,
+				"created_at": item.created_at.isoformat(),
+			},
+		}
+	)
+
+
+@require_GET
+def library_applications_view(request):
+	user, error_response = _require_user(request)
+	if error_response:
+		return error_response
+
+	queryset = LibraryApplication.objects.select_related("requester")
+	if user.user_type != SmartUser.MANAGEMENT:
+		queryset = queryset.filter(requester=user)
+
+	items = [
+		{
+			"id": item.id,
+			"requester_id": item.requester.id,
+			"requester_name": item.requester.name,
+			"requester_role": _user_type_label(item.requester_role),
+			"resource_type": item.resource_type,
+			"explanation": item.explanation,
+			"created_at": item.created_at.isoformat(),
+		}
+		for item in queryset
+	]
+
+	return JsonResponse({"items": items})

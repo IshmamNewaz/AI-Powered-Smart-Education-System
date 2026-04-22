@@ -1,0 +1,142 @@
+erDiagram
+
+    USER {
+        int user_id PK
+        string full_name
+        string email
+        string password_hash
+        string role
+        string status
+        datetime created_at
+    }
+
+    MANAGEMENT {
+        int management_id PK
+        int user_id FK
+        string employee_code
+        string designation
+        string department
+        string phone
+    }
+
+    DEPARTMENT {
+        int department_id PK
+        string department_name
+        string faculty_name
+        string office_email
+    }
+
+    PROGRAM {
+        int program_id PK
+        int department_id FK
+        string program_name
+        string degree_level
+        int duration_years
+    }
+
+    COURSE {
+        int course_id PK
+        int department_id FK
+        int program_id FK
+        string course_code
+        string course_title
+        int credit
+        string semester
+    }
+
+    STUDENT {
+        int student_id PK
+        int user_id FK
+        int program_id FK
+        string student_code
+        string current_semester
+        string academic_status
+        date admission_date
+    }
+
+    TEACHER {
+        int teacher_id PK
+        int user_id FK
+        int department_id FK
+        string teacher_code
+        string designation
+        string employment_status
+        date join_date
+    }
+
+    COURSE_ASSIGNMENT {
+        int course_assignment_id PK
+        int teacher_id FK
+        int course_id FK
+        string academic_session
+        date assigned_on
+    }
+
+    ENROLLMENT {
+        int enrollment_id PK
+        int student_id FK
+        int course_id FK
+        string academic_session
+        string enrollment_status
+    }
+
+    PERFORMANCE_PREDICTION {
+        int prediction_id PK
+        int student_id FK
+        int course_id FK
+        string predicted_outcome
+        float risk_score
+        datetime generated_at
+    }
+
+    REPORT {
+        int report_id PK
+        int management_id FK
+        string report_title
+        string report_type
+        date generated_on
+        string report_period
+    }
+
+    ANALYTICS_DASHBOARD {
+        int dashboard_id PK
+        int management_id FK
+        string dashboard_name
+        string dashboard_scope
+        datetime last_updated
+    }
+
+    SYSTEM_NOTICE {
+        int notice_id PK
+        int management_id FK
+        string title
+        text message
+        string target_role
+        datetime published_at
+    }
+
+    AUDIT_LOG {
+        int log_id PK
+        int user_id FK
+        string action_type
+        string entity_name
+        int entity_id
+        datetime action_time
+    }
+
+    USER ||--|| MANAGEMENT : has
+    DEPARTMENT ||--o{ PROGRAM : offers
+    DEPARTMENT ||--o{ COURSE : owns
+    PROGRAM ||--o{ COURSE : includes
+    PROGRAM ||--o{ STUDENT : contains
+    DEPARTMENT ||--o{ TEACHER : employs
+    TEACHER ||--o{ COURSE_ASSIGNMENT : assigned
+    COURSE ||--o{ COURSE_ASSIGNMENT : allocated
+    STUDENT ||--o{ ENROLLMENT : registers
+    COURSE ||--o{ ENROLLMENT : has
+    STUDENT ||--o{ PERFORMANCE_PREDICTION : receives
+    COURSE ||--o{ PERFORMANCE_PREDICTION : relates_to
+    MANAGEMENT ||--o{ REPORT : generates
+    MANAGEMENT ||--o{ ANALYTICS_DASHBOARD : monitors
+    MANAGEMENT ||--o{ SYSTEM_NOTICE : publishes
+    USER ||--o{ AUDIT_LOG : creates

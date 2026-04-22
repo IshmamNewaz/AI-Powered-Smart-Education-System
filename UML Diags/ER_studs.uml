@@ -1,0 +1,119 @@
+erDiagram
+    USER {
+        int user_id PK
+        string full_name
+        string email
+        string password_hash
+        string role
+        string status
+        datetime created_at
+    }
+
+    STUDENT {
+        int student_id PK
+        int user_id FK
+        string student_code
+        string department
+        string program
+        string semester
+        date admission_date
+        string phone
+    }
+
+    COURSE {
+        int course_id PK
+        string course_code
+        string course_title
+        int credit
+        string semester
+        string department
+    }
+
+    ENROLLMENT {
+        int enrollment_id PK
+        int student_id FK
+        int course_id FK
+        string academic_session
+        string enrollment_status
+        date enrolled_on
+    }
+
+    ASSESSMENT {
+        int assessment_id PK
+        int course_id FK
+        string assessment_type
+        string title
+        int total_marks
+        date assessment_date
+        float weight_percentage
+    }
+
+    RESULT {
+        int result_id PK
+        int enrollment_id FK
+        int assessment_id FK
+        float obtained_marks
+        string grade
+        string remarks
+        date published_on
+    }
+
+    ATTENDANCE {
+        int attendance_id PK
+        int enrollment_id FK
+        date attendance_date
+        string status
+        string remarks
+    }
+
+    PERFORMANCE_PREDICTION {
+        int prediction_id PK
+        int student_id FK
+        int course_id FK
+        float class_test_avg
+        float term_exam_score
+        float model_test_score
+        float attendance_rate
+        string predicted_outcome
+        float confidence_score
+        datetime generated_at
+    }
+
+    STUDENT_NOTIFICATION {
+        int notification_id PK
+        int student_id FK
+        string title
+        string message
+        string type
+        boolean is_read
+        datetime sent_at
+    }
+
+    AI_CHAT_SESSION {
+        int chat_session_id PK
+        int student_id FK
+        string session_title
+        datetime started_at
+        datetime ended_at
+    }
+
+    AI_CHAT_MESSAGE {
+        int message_id PK
+        int chat_session_id FK
+        string sender_type
+        text message_text
+        datetime sent_at
+    }
+
+    USER ||--|| STUDENT : has
+    STUDENT ||--o{ ENROLLMENT : enrolls_in
+    COURSE ||--o{ ENROLLMENT : contains
+    COURSE ||--o{ ASSESSMENT : includes
+    ENROLLMENT ||--o{ RESULT : receives
+    ASSESSMENT ||--o{ RESULT : evaluates
+    ENROLLMENT ||--o{ ATTENDANCE : tracks
+    STUDENT ||--o{ PERFORMANCE_PREDICTION : gets
+    COURSE ||--o{ PERFORMANCE_PREDICTION : related_to
+    STUDENT ||--o{ STUDENT_NOTIFICATION : receives
+    STUDENT ||--o{ AI_CHAT_SESSION : starts
+    AI_CHAT_SESSION ||--o{ AI_CHAT_MESSAGE : contains

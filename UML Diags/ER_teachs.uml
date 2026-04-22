@@ -1,0 +1,152 @@
+erDiagram
+
+    USER {
+        int user_id PK
+        string full_name
+        string email
+        string password_hash
+        string role
+        string status
+        datetime created_at
+    }
+
+    TEACHER {
+        int teacher_id PK
+        int user_id FK
+        string teacher_code
+        string department
+        string designation
+        string phone
+        date join_date
+    }
+
+    COURSE {
+        int course_id PK
+        string course_code
+        string course_title
+        int credit
+        string semester
+        string department
+    }
+
+    COURSE_ASSIGNMENT {
+        int course_assignment_id PK
+        int teacher_id FK
+        int course_id FK
+        string academic_session
+        string assigned_role
+        date assigned_on
+    }
+
+    STUDENT {
+        int student_id PK
+        string student_code
+        string full_name
+        string department
+        string program
+        string semester
+    }
+
+    ENROLLMENT {
+        int enrollment_id PK
+        int student_id FK
+        int course_id FK
+        string academic_session
+        string enrollment_status
+    }
+
+    ASSESSMENT {
+        int assessment_id PK
+        int course_id FK
+        int teacher_id FK
+        string assessment_type
+        string title
+        int total_marks
+        float weight_percentage
+        date assessment_date
+    }
+
+    RESULT {
+        int result_id PK
+        int enrollment_id FK
+        int assessment_id FK
+        float obtained_marks
+        string grade
+        string remarks
+        date published_on
+    }
+
+    ATTENDANCE {
+        int attendance_id PK
+        int enrollment_id FK
+        int teacher_id FK
+        date attendance_date
+        string status
+        string remarks
+    }
+
+    STUDY_MATERIAL {
+        int material_id PK
+        int course_id FK
+        int teacher_id FK
+        string title
+        string material_type
+        string file_url
+        datetime uploaded_at
+    }
+
+    ANNOUNCEMENT {
+        int announcement_id PK
+        int teacher_id FK
+        int course_id FK
+        string title
+        text message
+        datetime created_at
+    }
+
+    AI_CHAT_SESSION {
+        int chat_session_id PK
+        int teacher_id FK
+        string session_title
+        datetime started_at
+        datetime ended_at
+    }
+
+    AI_CHAT_MESSAGE {
+        int message_id PK
+        int chat_session_id FK
+        string sender_type
+        text message_text
+        datetime sent_at
+    }
+
+    PERFORMANCE_PREDICTION {
+        int prediction_id PK
+        int student_id FK
+        int course_id FK
+        int teacher_id FK
+        string predicted_outcome
+        float confidence_score
+        datetime generated_at
+    }
+
+    USER ||--|| TEACHER : has
+    TEACHER ||--o{ COURSE_ASSIGNMENT : assigned_to
+    COURSE ||--o{ COURSE_ASSIGNMENT : mapped_with
+    COURSE ||--o{ ENROLLMENT : has
+    STUDENT ||--o{ ENROLLMENT : registers
+    TEACHER ||--o{ ASSESSMENT : creates
+    COURSE ||--o{ ASSESSMENT : contains
+    ENROLLMENT ||--o{ RESULT : receives
+    ASSESSMENT ||--o{ RESULT : produces
+    TEACHER ||--o{ ATTENDANCE : records
+    ENROLLMENT ||--o{ ATTENDANCE : belongs_to
+    TEACHER ||--o{ STUDY_MATERIAL : uploads
+    COURSE ||--o{ STUDY_MATERIAL : includes
+    TEACHER ||--o{ ANNOUNCEMENT : posts
+    COURSE ||--o{ ANNOUNCEMENT : receives
+    TEACHER ||--o{ AI_CHAT_SESSION : starts
+    AI_CHAT_SESSION ||--o{ AI_CHAT_MESSAGE : contains
+    TEACHER ||--o{ PERFORMANCE_PREDICTION : requests
+    STUDENT ||--o{ PERFORMANCE_PREDICTION : evaluated_for
+    COURSE ||--o{ PERFORMANCE_PREDICTION : based_on
