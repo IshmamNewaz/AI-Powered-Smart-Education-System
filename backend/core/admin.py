@@ -32,4 +32,3 @@ class LibraryApplicationAdmin(admin.ModelAdmin):
 	list_display = ("id", "requester", "requester_role", "resource_type", "created_at")
 	search_fields = ("requester__name", "resource_type")
 
-# Register your models here.
